@@ -37,6 +37,12 @@ TOKEN_FILE = os.path.join(CREDS_DIR, "token.json")
 CLIENT_SECRET_FILE = os.path.join(CREDS_DIR, "client_secret.json")
 HISTORY_FILE = os.path.join(BASE_DIR, "omar_history.json")
 
+# Quota/throughput limits. YouTube API = 10,000 units/day, each upload = 1,600.
+# That caps us at ~6 uploads/day. Stay safely under it.
+MAX_UPLOADS_PER_RUN = 5         # Hard cap for any single agent run
+MAX_CLIPS_PER_VIDEO = 2         # Only keep the top-N scoring clips per source
+MAX_VIDEOS_PER_RUN = 3          # How many source videos to process per run
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(CREDS_DIR, exist_ok=True)
 
@@ -429,9 +435,14 @@ def download_video(video_id, output_dir):
         "--merge-output-format", "mp4",
         "-o", output_path,
         "--no-playlist", "--no-warnings",
-        "--ffmpeg-location", os.path.dirname(FFMPEG_PATH),
         url,
     ]
+    # Only pass --ffmpeg-location if we actually found a real ffmpeg path.
+    ffmpeg_dir = os.path.dirname(FFMPEG_PATH)
+    if ffmpeg_dir and os.path.isdir(ffmpeg_dir):
+        cmd.insert(-1, "--ffmpeg-location")
+        cmd.insert(-1, ffmpeg_dir)
+
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if result.returncode != 0:
         raise RuntimeError(f"yt-dlp failed: {result.stderr[:500]}")
@@ -626,8 +637,12 @@ def upload_to_youtube(youtube_service, video_path, title, description, tags):
 # Main Agent Workflow
 # ---------------------------------------------------------------------------
 
-def process_video(video_id, video_title, transcript, session_dir, youtube_service=None):
-    """Process a single video: analyze, clip, and optionally upload."""
+def process_video(video_id, video_title, transcript, session_dir,
+                  youtube_service=None, upload_budget=None):
+    """Process a single video: analyze, clip, and optionally upload.
+
+    upload_budget: max uploads this call is allowed to perform (None = unlimited).
+    """
     print(f"\n  [{AGENT_NAME}] Analyzing transcript ({len(transcript)} segments)...")
     moments = analyze_viral_moments(transcript)
 
@@ -635,7 +650,11 @@ def process_video(video_id, video_title, transcript, session_dir, youtube_servic
         print(f"  [{AGENT_NAME}] No viral moments found. Skipping.")
         return []
 
-    print(f"  [{AGENT_NAME}] Found {len(moments)} viral moments!")
+    # Keep only the top N by score (not by chronological order) to save quota.
+    moments = sorted(moments, key=lambda m: m["score"], reverse=True)[:MAX_CLIPS_PER_VIDEO]
+    moments.sort(key=lambda m: m["start"])
+
+    print(f"  [{AGENT_NAME}] Keeping top {len(moments)} viral moments:")
     for m in moments:
         mins = int(m['start'] // 60)
         secs = int(m['start'] % 60)
@@ -669,14 +688,17 @@ def process_video(video_id, video_title, transcript, session_dir, youtube_servic
 
         print(f"  [{AGENT_NAME}] Title: {title}")
 
-        # Upload if authenticated
-        if youtube_service:
+        # Upload if authenticated and we still have budget
+        budget_exhausted = upload_budget is not None and len(uploaded) >= upload_budget
+        if youtube_service and not budget_exhausted:
             try:
                 yt_id = upload_to_youtube(youtube_service, clip_path, title, description, tags)
                 uploaded.append({"youtube_id": yt_id, "title": title, "clip": clip_path})
             except Exception as e:
                 print(f"  [{AGENT_NAME}] Upload failed: {e}")
                 print(f"  [{AGENT_NAME}] Clip saved at: {clip_path}")
+        elif budget_exhausted:
+            print(f"  [{AGENT_NAME}] Upload budget exhausted — clip saved at: {clip_path}")
         else:
             print(f"  [{AGENT_NAME}] No YouTube auth — clip saved at: {clip_path}")
 
@@ -711,22 +733,34 @@ def run_auto_mode(api_key):
     history = load_history()
     total_uploaded = 0
 
-    for video in candidates[:3]:  # Process top 3 videos
+    for video in candidates[:MAX_VIDEOS_PER_RUN]:
         vid = video["video_id"]
+
+        # Stop early if we've hit the per-run upload cap.
+        remaining = MAX_UPLOADS_PER_RUN - total_uploaded
+        if yt_service and remaining <= 0:
+            print(f"\n  [{AGENT_NAME}] Hit daily upload cap ({MAX_UPLOADS_PER_RUN}). Stopping.")
+            break
+
         print(f"\n  [{AGENT_NAME}] Processing: {video['title']}")
 
         # Fetch transcript
         transcript, error = fetch_transcript(vid)
         if not transcript:
             print(f"  [{AGENT_NAME}] No transcript available. Skipping.")
+            history["processed"].append(vid)  # don't retry this one
+            save_history(history)
             continue
 
         # Create session directory
         session_dir = os.path.join(OUTPUT_DIR, f"{vid}_{uuid.uuid4().hex[:6]}")
         os.makedirs(session_dir, exist_ok=True)
 
-        # Process
-        uploaded = process_video(vid, video["title"], transcript, session_dir, yt_service)
+        # Process with remaining upload budget
+        uploaded = process_video(
+            vid, video["title"], transcript, session_dir, yt_service,
+            upload_budget=remaining if yt_service else None,
+        )
         total_uploaded += len(uploaded)
 
         # Mark as processed
@@ -744,6 +778,42 @@ def run_auto_mode(api_key):
     print(f"  [{AGENT_NAME}] Done! Uploaded {total_uploaded} shorts.")
     print(f"  [{AGENT_NAME}] Total videos processed: {len(history['processed'])}")
     print(f"{'='*50}\n")
+
+
+def run_schedule_mode(api_key, interval_hours=24):
+    """Run auto mode on a loop forever. Stays alive between runs.
+
+    Ctrl+C to stop. Sleeps `interval_hours` between runs.
+    """
+    print(f"\n{'='*50}")
+    print(f"  {AGENT_NAME} Agent — SCHEDULED MODE")
+    print(f"  Running every {interval_hours} hour(s). Ctrl+C to stop.")
+    print(f"{'='*50}")
+
+    run_count = 0
+    while True:
+        run_count += 1
+        start_time = datetime.now()
+        print(f"\n  [{AGENT_NAME}] === Run #{run_count} @ {start_time.strftime('%Y-%m-%d %H:%M:%S')} ===")
+
+        try:
+            run_auto_mode(api_key)
+        except KeyboardInterrupt:
+            print(f"\n  [{AGENT_NAME}] Stopped by user.")
+            return
+        except Exception as e:
+            print(f"  [{AGENT_NAME}] Run #{run_count} crashed: {e}")
+            print(f"  [{AGENT_NAME}] Continuing — next run in {interval_hours}h.")
+
+        next_run = interval_hours * 3600
+        next_time = datetime.now().strftime('%H:%M:%S')
+        print(f"\n  [{AGENT_NAME}] Sleeping {interval_hours}h until next run...")
+        print(f"  [{AGENT_NAME}] Current time: {next_time}")
+        try:
+            time.sleep(next_run)
+        except KeyboardInterrupt:
+            print(f"\n  [{AGENT_NAME}] Stopped by user.")
+            return
 
 
 def run_url_mode(url, api_key):
@@ -778,34 +848,44 @@ def run_interactive():
     print(f"  {AGENT_NAME} Agent — AI YouTube Shorts Automation")
     print(f"{'='*50}")
     print()
-    print(f"  1. Auto-find trending & upload Shorts")
-    print(f"  2. Process a specific YouTube URL")
-    print(f"  3. Set up YouTube OAuth2 (first time)")
-    print(f"  4. View upload history")
-    print(f"  5. Exit")
+    print(f"  1. Auto-find trending & upload Shorts (one run)")
+    print(f"  2. Run on schedule (daily, continuous)")
+    print(f"  3. Process a specific YouTube URL")
+    print(f"  4. Set up YouTube OAuth2 (first time)")
+    print(f"  5. View upload history")
+    print(f"  6. Exit")
     print()
 
-    choice = input("  Choose (1-5): ").strip()
+    choice = input("  Choose (1-6): ").strip()
 
     if choice == "1":
         api_key = _get_api_key()
         if api_key:
             run_auto_mode(api_key)
     elif choice == "2":
+        api_key = _get_api_key()
+        if api_key:
+            hours_raw = input("  Interval in hours (default 24): ").strip()
+            try:
+                hours = int(hours_raw) if hours_raw else 24
+            except ValueError:
+                hours = 24
+            run_schedule_mode(api_key, interval_hours=hours)
+    elif choice == "3":
         url = input("  Paste YouTube URL: ").strip()
         api_key = _get_api_key()
         if url:
             run_url_mode(url, api_key)
-    elif choice == "3":
-        setup_oauth()
     elif choice == "4":
+        setup_oauth()
+    elif choice == "5":
         history = load_history()
         print(f"\n  Videos processed: {len(history['processed'])}")
         print(f"  Shorts uploaded: {len(history['uploaded'])}")
         for u in history["uploaded"][-10:]:
             print(f"    - {u['title']} ({u['date'][:10]})")
         print()
-    elif choice == "5":
+    elif choice == "6":
         print(f"  [{AGENT_NAME}] Goodbye!")
         sys.exit(0)
     else:
@@ -835,13 +915,19 @@ def _get_api_key():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=f"{AGENT_NAME} Agent - YouTube Shorts Automation")
-    parser.add_argument("--auto", action="store_true", help="Auto-find trending videos and upload")
+    parser.add_argument("--auto", action="store_true", help="Auto-find trending videos and upload (one run)")
+    parser.add_argument("--schedule", type=int, nargs="?", const=24, metavar="HOURS",
+                        help="Run auto mode on a loop every N hours (default 24)")
     parser.add_argument("--url", type=str, help="Process a specific YouTube URL")
     parser.add_argument("--auth", action="store_true", help="Set up YouTube OAuth2 authentication")
     args = parser.parse_args()
 
     if args.auth:
         setup_oauth()
+    elif args.schedule is not None:
+        api_key = _get_api_key()
+        if api_key:
+            run_schedule_mode(api_key, interval_hours=args.schedule)
     elif args.auto:
         api_key = _get_api_key()
         if api_key:
