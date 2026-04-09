@@ -1,3 +1,6 @@
 downloads/
+omar_output/
+credentials/
+omar_history.json
 __pycache__/
 *.pyc

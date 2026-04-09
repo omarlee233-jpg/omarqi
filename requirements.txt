@@ -3,3 +3,5 @@ gunicorn
 youtube-transcript-api
 yt-dlp
 google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
