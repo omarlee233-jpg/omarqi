@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OMARQI — AI Viral Clip Generator</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <!-- Navbar -->
+    <nav class="navbar">
+        <div class="nav-inner">
+            <div class="logo">
+                <span class="logo-icon">&#9889;</span>
+                <span class="logo-text">OMAR<span class="logo-accent">QI</span></span>
+            </div>
+            <div class="nav-links">
+                <button class="nav-btn" onclick="toggleConfig()">
+                    <span class="key-icon">&#128273;</span> API Key
+                </button>
+            </div>
+        </div>
+    </nav>
+
+    <!-- API Key Modal -->
+    <div class="modal-overlay hidden" id="configModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>YouTube API Key</h3>
+                <button class="modal-close" onclick="toggleConfig()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="modal-desc">Add your YouTube Data API key for enhanced video metadata (title, views, channel info). Without it, OMARQI still works — you just won't see video details.</p>
+                <div class="steps-grid">
+                    <div class="step">
+                        <div class="step-num">1</div>
+                        <p>Go to <a href="https://console.cloud.google.com/" target="_blank">Google Cloud Console</a></p>
+                    </div>
+                    <div class="step">
+                        <div class="step-num">2</div>
+                        <p>Enable <strong>YouTube Data API v3</strong></p>
+                    </div>
+                    <div class="step">
+                        <div class="step-num">3</div>
+                        <p>Create an <strong>API Key</strong> under Credentials</p>
+                    </div>
+                    <div class="step">
+                        <div class="step-num">4</div>
+                        <p>Paste it below and hit Save</p>
+                    </div>
+                </div>
+                <div class="modal-input-row">
+                    <input type="text" id="apiKeyInput" placeholder="AIza..." />
+                    <button class="btn btn-glow" onclick="saveApiKey()">Save Key</button>
+                </div>
+                <div class="modal-status" id="apiKeyStatus"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Hero Section -->
+    <section class="hero">
+        <div class="hero-inner">
+            <div class="hero-badge">AI-Powered Clip Engine</div>
+            <h1 class="hero-title">
+                Turn any video into<br>
+                <span class="gradient-text">5 viral clips</span> instantly
+            </h1>
+            <p class="hero-subtitle">
+                OMARQI analyzes your YouTube video's transcript, detects the most engaging moments,
+                and extracts them as ready-to-post MP4 clips.
+            </p>
+
+            <!-- URL Input -->
+            <div class="hero-input-wrapper">
+                <div class="input-container">
+                    <div class="input-icon">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                        </svg>
+                    </div>
+                    <input type="text" id="urlInput" placeholder="Paste your YouTube video URL here..." />
+                    <button class="btn btn-glow btn-analyze" id="analyzeBtn" onclick="analyzeVideo()">
+                        <span id="analyzeBtnText">Generate Clips</span>
+                        <span id="analyzeSpinner" class="spinner hidden"></span>
+                    </button>
+                </div>
+                <div class="input-hints">
+                    <span>Supports: youtube.com/watch, youtu.be, shorts, embeds</span>
+                </div>
+            </div>
+        </div>
+        <div class="hero-glow"></div>
+    </section>
+
+    <!-- Error Display -->
+    <div class="container">
+        <div class="error-toast hidden" id="analyzeError">
+            <span class="error-icon">&#9888;</span>
+            <span id="analyzeErrorText"></span>
+        </div>
+    </div>
+
+    <!-- Results Section -->
+    <section class="results-section hidden" id="resultsSection">
+        <div class="container">
+            <!-- Video Info Bar -->
+            <div class="video-bar" id="metadataCard">
+                <img id="metaThumb" class="video-thumb" src="" alt="" />
+                <div class="video-details">
+                    <h2 id="metaTitle" class="video-title"></h2>
+                    <div class="video-meta-row">
+                        <span id="metaChannel" class="video-channel"></span>
+                        <span class="meta-dot">&#183;</span>
+                        <span id="metaViews" class="video-views"></span>
+                    </div>
+                    <p id="metaWarning" class="video-warning hidden"></p>
+                </div>
+            </div>
+
+            <!-- Clips Grid Header -->
+            <div class="clips-header">
+                <div class="clips-header-left">
+                    <h2 class="clips-title">Detected Viral Moments</h2>
+                    <p class="clips-subtitle">Ranked by viral potential score</p>
+                </div>
+                <div class="select-all-row">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="selectAllCheck" checked onchange="toggleSelectAll()" />
+                        <span>Select All</span>
+                    </label>
+                </div>
+            </div>
+
+            <!-- Moments Grid -->
+            <div class="moments-grid" id="momentsContainer"></div>
+
+            <!-- Extract CTA -->
+            <div class="extract-cta">
+                <button class="btn btn-glow btn-extract" id="extractBtn" onclick="extractClips()">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                        <polyline points="7 10 12 15 17 10"></polyline>
+                        <line x1="12" y1="15" x2="12" y2="3"></line>
+                    </svg>
+                    <span id="extractBtnText">Extract & Download Clips</span>
+                    <span id="extractSpinner" class="spinner hidden"></span>
+                </button>
+                <div class="error-toast hidden" id="extractError" style="margin-top: 12px;">
+                    <span class="error-icon">&#9888;</span>
+                    <span id="extractErrorText"></span>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Processing Overlay -->
+    <div class="processing-overlay hidden" id="progressSection">
+        <div class="processing-card">
+            <div class="processing-animation">
+                <div class="pulse-ring"></div>
+                <div class="pulse-ring delay-1"></div>
+                <div class="pulse-ring delay-2"></div>
+                <div class="processing-icon">&#9889;</div>
+            </div>
+            <h2>OMARQI is working...</h2>
+            <p>Downloading video & cutting your viral clips. This may take a few minutes.</p>
+            <div class="processing-bar">
+                <div class="processing-fill"></div>
+            </div>
+            <div class="processing-steps">
+                <div class="p-step active" id="stepDownload">
+                    <span class="p-step-dot"></span> Downloading video
+                </div>
+                <div class="p-step" id="stepCutting">
+                    <span class="p-step-dot"></span> Cutting clips
+                </div>
+                <div class="p-step" id="stepFinishing">
+                    <span class="p-step-dot"></span> Finalizing
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Download Section -->
+    <section class="download-section hidden" id="downloadSection">
+        <div class="container">
+            <div class="download-header">
+                <div class="success-icon">&#10003;</div>
+                <h2>Your clips are ready!</h2>
+                <p>Download them individually or all at once</p>
+            </div>
+            <div class="clips-download-grid" id="clipsContainer"></div>
+            <div class="download-actions">
+                <button class="btn btn-glow" onclick="downloadAll()">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                        <polyline points="7 10 12 15 17 10"></polyline>
+                        <line x1="12" y1="15" x2="12" y2="3"></line>
+                    </svg>
+                    Download All Clips
+                </button>
+                <button class="btn btn-ghost" onclick="cleanupSession()">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="3 6 5 6 21 6"></polyline>
+                        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                    </svg>
+                    Delete from Server
+                </button>
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <div class="container">
+            <div class="footer-inner">
+                <div class="footer-brand">
+                    <span class="logo-icon">&#9889;</span>
+                    <span class="logo-text">OMAR<span class="logo-accent">QI</span></span>
+                </div>
+                <p class="footer-text">Powered by yt-dlp, ffmpeg & YouTube Data API v3</p>
+            </div>
+        </div>
+    </footer>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

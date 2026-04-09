@@ -1,0 +1,4 @@
+flask
+youtube-transcript-api
+yt-dlp
+google-api-python-client
