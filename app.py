@@ -17,12 +17,23 @@ DOWNLOADS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downlo
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
 # Tool paths — resolved at startup so subprocess always finds them
-FFMPEG_PATH = shutil.which("ffmpeg") or os.path.join(
-    os.environ.get("LOCALAPPDATA", ""),
-    "Microsoft", "WinGet", "Packages",
-    "Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe",
-    "ffmpeg-8.1-full_build", "bin", "ffmpeg.exe",
-)
+def _find_ffmpeg():
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    # Windows winget install location fallback
+    local = os.environ.get("LOCALAPPDATA", "")
+    if local:
+        winget_path = os.path.join(
+            local, "Microsoft", "WinGet", "Packages",
+            "Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe",
+            "ffmpeg-8.1-full_build", "bin", "ffmpeg.exe",
+        )
+        if os.path.exists(winget_path):
+            return winget_path
+    return "ffmpeg"  # hope it's on PATH
+
+FFMPEG_PATH = _find_ffmpeg()
 YTDLP_PATH = shutil.which("yt-dlp") or "yt-dlp"
 
 # ---------------------------------------------------------------------------
