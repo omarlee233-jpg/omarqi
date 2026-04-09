@@ -10,6 +10,9 @@ from youtube_transcript_api.formatters import TextFormatter
 
 app = Flask(__name__)
 
+# In-memory transcript cache keyed by video_id
+_transcript_cache = {}
+
 DOWNLOADS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
@@ -422,15 +425,108 @@ def download_video(video_id, output_dir):
     raise FileNotFoundError(f"Downloaded video not found in {output_dir}")
 
 
-def cut_clip(input_path, start, end, output_path):
-    """Cut a clip in TikTok/Shorts 9:16 vertical format (1080x1920)."""
+def generate_ass_subtitles(transcript, clip_start, clip_end, ass_path):
+    """Generate an ASS subtitle file for a clip from transcript segments.
+
+    Captions are styled TikTok-style: bold white text with black outline,
+    positioned at the bottom-center of the screen, one short phrase at a time.
+    """
+    # ASS header with TikTok-style formatting
+    header = """[Script Info]
+Title: OMARQI Captions
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,72,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,0,2,40,40,200,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+    events = []
+
+    for seg in transcript:
+        seg_start = seg["start"]
+        seg_end = seg_start + seg["duration"]
+
+        # Skip segments outside clip range
+        if seg_end <= clip_start or seg_start >= clip_end:
+            continue
+
+        # Adjust times relative to clip start
+        rel_start = max(seg_start - clip_start, 0)
+        rel_end = min(seg_end - clip_start, clip_end - clip_start)
+
+        text = seg["text"].strip()
+        if not text:
+            continue
+
+        # Split long text into chunks of ~4 words for TikTok-style word-by-word feel
+        words = text.split()
+        if len(words) > 5:
+            chunk_duration = (rel_end - rel_start) / max(math.ceil(len(words) / 4), 1)
+            for c in range(0, len(words), 4):
+                chunk = " ".join(words[c:c + 4])
+                c_start = rel_start + (c / max(len(words), 1)) * (rel_end - rel_start)
+                c_end = min(c_start + chunk_duration, rel_end)
+                events.append((c_start, c_end, chunk.upper()))
+        else:
+            events.append((rel_start, rel_end, text.upper()))
+
+    # Write ASS file
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(header)
+        for start_t, end_t, text in events:
+            s = format_ass_time(start_t)
+            e = format_ass_time(end_t)
+            # Escape special ASS characters
+            clean_text = text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+            f.write(f"Dialogue: 0,{s},{e},Default,,0,0,0,,{clean_text}\n")
+
+    return ass_path
+
+
+def format_ass_time(seconds):
+    """Convert seconds to ASS timestamp format H:MM:SS.CC"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    cs = int((seconds % 1) * 100)
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def cut_clip(input_path, start, end, output_path, transcript=None):
+    """Cut a clip in TikTok/Shorts 9:16 vertical format (1080x1920) with burned-in captions."""
     duration = end - start
-    # Crop center of landscape video to 9:16, then scale to 1080x1920
-    vf = (
-        "crop=ih*9/16:ih,"   # crop width to 9:16 ratio from center
-        "scale=1080:1920,"   # scale to TikTok resolution
-        "setsar=1"           # square pixels
-    )
+
+    # Generate subtitle file if transcript available
+    ass_path = output_path.replace(".mp4", ".ass")
+    has_subs = False
+    if transcript:
+        generate_ass_subtitles(transcript, start, end, ass_path)
+        has_subs = os.path.exists(ass_path)
+
+    # Build video filter chain
+    # Escape path for ffmpeg filter (Windows backslashes and colons)
+    if has_subs:
+        escaped_ass = ass_path.replace("\\", "/").replace(":", "\\:")
+        vf = (
+            f"crop=ih*9/16:ih,"
+            f"scale=1080:1920,"
+            f"setsar=1,"
+            f"ass='{escaped_ass}'"
+        )
+    else:
+        vf = (
+            "crop=ih*9/16:ih,"
+            "scale=1080:1920,"
+            "setsar=1"
+        )
+
     cmd = [
         FFMPEG_PATH, "-y",
         "-ss", str(start),
@@ -449,6 +545,13 @@ def cut_clip(input_path, start, end, output_path):
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+    # Clean up subtitle file
+    if has_subs:
+        try:
+            os.remove(ass_path)
+        except OSError:
+            pass
 
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {result.stderr[:500]}")
@@ -500,6 +603,9 @@ def analyze():
             "metadata": metadata,
         }), 400
 
+    # Cache transcript so /extract can use it for captions
+    _transcript_cache[video_id] = transcript
+
     return jsonify({
         "video_id": video_id,
         "metadata": metadata,
@@ -517,6 +623,9 @@ def extract():
     video_id = data["video_id"]
     moments = data["moments"]
 
+    # Get cached transcript for caption syncing
+    transcript = _transcript_cache.get(video_id, [])
+
     session_id = uuid.uuid4().hex[:12]
     session_dir = os.path.join(DOWNLOADS_DIR, session_id)
     os.makedirs(session_dir, exist_ok=True)
@@ -525,12 +634,12 @@ def extract():
         # Download the full video
         video_path = download_video(video_id, session_dir)
 
-        # Cut each clip
+        # Cut each clip with synced captions
         clips = []
         for i, moment in enumerate(moments):
             clip_name = f"clip_{i + 1}.mp4"
             clip_path = os.path.join(session_dir, clip_name)
-            cut_clip(video_path, moment["start"], moment["end"], clip_path)
+            cut_clip(video_path, moment["start"], moment["end"], clip_path, transcript=transcript)
             clips.append({
                 "filename": clip_name,
                 "label": moment.get("label", f"Clip {i + 1}"),
