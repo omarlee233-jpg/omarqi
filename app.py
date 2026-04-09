@@ -1,8 +1,10 @@
 import os
 import re
+import json
 import uuid
 import math
 import shutil
+import tempfile
 import subprocess
 from flask import Flask, request, jsonify, send_from_directory, render_template
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -144,38 +146,117 @@ def fetch_metadata(video_id, api_key):
         }
 
 
+def fetch_transcript_via_ytdlp(video_id):
+    """Fallback transcript fetcher that uses yt-dlp's auto-sub feature.
+
+    yt-dlp pulls subtitles via YouTube's player config endpoint, which is much
+    more resistant to cloud-IP blocks than the youtube-transcript-api private
+    endpoint. Used when the primary fetcher fails.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        sub_template = os.path.join(tmp, "%(id)s.%(ext)s")
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        cmd = [
+            YTDLP_PATH,
+            "--write-auto-sub",
+            "--write-sub",
+            "--sub-lang", "en.*",   # Match en, en-US, en-GB, en-orig, etc.
+            "--sub-format", "json3",
+            "--skip-download",
+            "--no-warnings",
+            "-o", sub_template,
+            url,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            return [], f"yt-dlp subtitle fetch failed: {result.stderr[:200]}"
+
+        # Pick the first json3 file we find (prefer non-orig/translated variant)
+        json_files = sorted(
+            [f for f in os.listdir(tmp) if f.endswith(".json3")],
+            key=lambda f: ("orig" in f, f),  # non-orig first
+        )
+        if not json_files:
+            return [], "No subtitles available for this video"
+
+        sub_path = os.path.join(tmp, json_files[0])
+        try:
+            with open(sub_path, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+        except Exception as e:
+            return [], f"Failed to parse subtitle file: {e}"
+
+        transcript = []
+        for event in data.get("events", []):
+            segs = event.get("segs")
+            if not segs:
+                continue
+            start = event.get("tStartMs", 0) / 1000.0
+            duration = event.get("dDurationMs", 0) / 1000.0
+            text = "".join(seg.get("utf8", "") for seg in segs).strip()
+            # yt-dlp's json3 double-encodes UTF-8 bytes through cp1252, so a
+            # raw "…" becomes "â€¦". Repair by re-encoding as cp1252 then
+            # decoding as utf-8. Skip if the round-trip fails.
+            try:
+                text = text.encode("cp1252").decode("utf-8")
+            except (UnicodeDecodeError, UnicodeEncodeError):
+                pass
+            if text and text != "\n":
+                transcript.append({"text": text, "start": start, "duration": duration})
+
+        if not transcript:
+            return [], "Subtitle file was empty"
+        return transcript, None
+
+
 def fetch_transcript(video_id):
-    """Fetch the video transcript using youtube_transcript_api."""
+    """Fetch transcript via youtube_transcript_api, falling back to yt-dlp on failure.
+
+    The youtube_transcript_api library uses an endpoint that YouTube blocks for
+    most cloud-provider IPs (Render, AWS, GCP, etc.). When that fails — for any
+    reason — we fall back to yt-dlp which uses the public player config endpoint
+    and is much harder to block.
+    """
     api = YouTubeTranscriptApi()
+    primary_error = None
     try:
         result = api.fetch(video_id)
         transcript = [
             {"text": s.text, "start": s.start, "duration": s.duration}
             for s in result.snippets
         ]
-        return transcript, None
+        if transcript:
+            return transcript, None
     except Exception as e:
-        # Try to get auto-generated captions in any language
-        try:
-            transcript_list = api.list(video_id)
-            for t in transcript_list:
-                try:
-                    result = t.translate("en").fetch()
-                    transcript = [
-                        {"text": s.text, "start": s.start, "duration": s.duration}
-                        for s in result.snippets
-                    ]
-                    return transcript, None
-                except Exception:
-                    result = t.fetch()
-                    transcript = [
-                        {"text": s.text, "start": s.start, "duration": s.duration}
-                        for s in result.snippets
-                    ]
-                    return transcript, None
-        except Exception:
-            pass
-        return [], str(e)
+        primary_error = str(e)
+
+    # Try translating any available transcript to English (still primary API)
+    try:
+        transcript_list = api.list(video_id)
+        for t in transcript_list:
+            try:
+                result = t.translate("en").fetch()
+            except Exception:
+                result = t.fetch()
+            transcript = [
+                {"text": s.text, "start": s.start, "duration": s.duration}
+                for s in result.snippets
+            ]
+            if transcript:
+                return transcript, None
+    except Exception as e:
+        if not primary_error:
+            primary_error = str(e)
+
+    # Final fallback: yt-dlp
+    transcript, ytdlp_error = fetch_transcript_via_ytdlp(video_id)
+    if transcript:
+        return transcript, None
+
+    return [], (
+        f"Both transcript sources failed. "
+        f"Primary: {primary_error or 'unknown'} | yt-dlp fallback: {ytdlp_error}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -710,4 +791,5 @@ if __name__ == "__main__":
     print("  --------------------------------")
     print("  Open http://localhost:5000 in your browser")
     print()
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    # use_reloader=False so edits to other .py files don't kill the server
+    app.run(debug=True, use_reloader=False, host="0.0.0.0", port=5000)
